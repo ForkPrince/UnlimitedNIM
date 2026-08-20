@@ -1,6 +1,24 @@
-# UnlimitedNIM
+<p align="center">
+  <img src="assets/logo.svg" alt="UnlimitedNIM" width="600"/>
+</p>
 
-**Make NVIDIA's 40 RPM free tier feel unlimited for your coding agents.**
+<h3 align="center">UnlimitedNIM</h3>
+
+<p align="center">
+  Make NVIDIA's 40 RPM free tier feel unlimited. Smart priority queue proxy for coding agents.
+</p>
+
+<p align="center">
+  <a href="https://github.com/shivnathtathe/UnlimitedNIM/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"/></a>
+  <a href="https://github.com/shivnathtathe/UnlimitedNIM"><img src="https://img.shields.io/badge/tests-43%20passing-brightgreen.svg" alt="Tests"/></a>
+  <a href="https://github.com/shivnathtathe/UnlimitedNIM"><img src="https://img.shields.io/badge/NVIDIA%20NIM-40%20RPM-76b900.svg" alt="NVIDIA NIM"/></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python"/>
+  <img src="https://img.shields.io/badge/FastAPI-async-009688.svg" alt="FastAPI"/>
+</p>
+
+<p align="center">
+  <b>Works with Cline · Roo Code · OpenCode · Any OpenAI-compatible agent</b>
+</p>
 
 ## The Problem
 
