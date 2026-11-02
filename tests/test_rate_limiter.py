@@ -350,6 +350,26 @@ async def test_tc024_idle_then_100_burst(fake_clock):
 
 
 @pytest.mark.asyncio
+async def test_sliding_window_blocks_burst_across_boundary(fake_clock):
+    limiter = make_limiter(fake_clock)
+    fake_clock.advance(59.9)
+    await acquire_many(limiter, 40)
+    assert limiter.window_count == 40
+
+    fake_clock.advance(0.2)  # t = 60.1, just past the old tumbling boundary
+    queued = asyncio.create_task(limiter.acquire(3))
+    await settle()
+    assert limiter.queue_depth == 1
+    assert limiter.window_count == 40
+
+    fake_clock.advance(59.8)  # t = 119.9, the first 40 have aged out
+    await limiter.drain()
+    await settle()
+    assert queued.done()
+    assert limiter.window_count == 1
+
+
+@pytest.mark.asyncio
 async def test_tc020_stale_inflight_swept(fake_clock):
     limiter = make_limiter(fake_clock)
     slots = await acquire_many(limiter, 5)

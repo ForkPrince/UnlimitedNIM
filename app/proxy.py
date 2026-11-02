@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import email.utils
 import json
 import logging
+import random
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional, Tuple
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Awaitable, Callable, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request
@@ -120,7 +123,15 @@ def create_app(
         client: Optional[httpx.AsyncClient] = None
         resp: Optional[httpx.Response] = None
         try:
-            client, resp = await _open_upstream(settings, body, request_id)
+            slot, client, resp = await _acquire_and_open(
+                limiter,
+                settings,
+                body,
+                slot.priority,
+                slot,
+                request_id,
+                request.is_disconnected,
+            )
             payload = await resp.aread()
             content_type = resp.headers.get("content-type", "application/json")
             return Response(
@@ -154,7 +165,15 @@ async def _stream_events(
     client: Optional[httpx.AsyncClient] = None
     resp: Optional[httpx.Response] = None
     try:
-        client, resp = await _open_upstream(settings, body, slot.request_id)
+        slot, client, resp = await _acquire_and_open(
+            limiter,
+            settings,
+            body,
+            slot.priority,
+            slot,
+            slot.request_id,
+            request.is_disconnected,
+        )
         if resp.status_code != 200:
             error_payload = (await resp.aread()).decode("utf-8", "replace")
             yield _sse_error(slot.request_id, resp.status_code, error_payload)
@@ -191,19 +210,101 @@ async def _open_upstream(
     kwargs: dict = {"timeout": settings.httpx_timeout()}
     if settings.transport is not None:
         kwargs["transport"] = settings.transport
-    for attempt in range(settings.http_retries + 1):
-        client = httpx.AsyncClient(**kwargs)
-        req = client.build_request("POST", url, json=body, headers=headers)
-        resp = await client.send(req, stream=True)
-        if resp.status_code == 429 and attempt < settings.http_retries:
+    client = httpx.AsyncClient(**kwargs)
+    req = client.build_request("POST", url, json=body, headers=headers)
+    resp = await client.send(req, stream=True)
+    return client, resp
+
+
+def _parse_retry_after(resp: httpx.Response) -> Optional[float]:
+    """Return the Retry-After delay in seconds, if the upstream sent one."""
+    value = resp.headers.get("retry-after")
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+async def _acquire_and_open(
+    limiter: RateLimiter,
+    settings: Settings,
+    body: dict,
+    priority: int,
+    slot: Slot,
+    request_id: str,
+    is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
+) -> Tuple[Slot, httpx.AsyncClient, httpx.Response]:
+    """Open the upstream, waiting out 429s instead of leaking them.
+
+    A 429 means the upstream rate-limit window is exhausted. Rather than
+    returning that to the client, release the current slot, wait until the
+    local sliding window has room again (or until Retry-After expires), then
+    re-acquire and retry. The default config retries forever, so a rate limit
+    is invisible to the client.
+    """
+    attempt = 0
+    try:
+        while True:
+            client, resp = await _open_upstream(settings, body, request_id)
+            if resp.status_code != 429:
+                return slot, client, resp
+
+            if settings.http_retries >= 0 and attempt >= settings.http_retries:
+                # Budget exhausted: hand the final 429 back to the caller.
+                return slot, client, resp
+
+            retry_after = _parse_retry_after(resp)
             await resp.aclose()
             await client.aclose()
-            backoff = settings.backoff_base * (2 ** attempt)
-            log.warning("upstream 429 for %s, retrying in %.1fs", request_id, backoff)
-            await asyncio.sleep(backoff)
-            continue
-        return client, resp
-    raise RuntimeError("unreachable")
+
+            wait = max(
+                limiter.next_slot_in(),
+                settings.backoff_base * (2 ** attempt),
+            )
+            if retry_after is not None:
+                wait = max(wait, retry_after)
+            wait = max(wait, 0.001)
+            wait += random.uniform(0, min(wait * 0.1, 1.0))
+
+            attempt += 1
+            log.warning(
+                "upstream 429 for %s; retrying in %.1fs (attempt %d/%s)",
+                request_id,
+                wait,
+                attempt,
+                "inf" if settings.http_retries < 0 else settings.http_retries,
+            )
+
+            await limiter.release(slot)
+            await asyncio.sleep(wait)
+            if is_disconnected is not None and await is_disconnected():
+                raise asyncio.CancelledError
+            while True:
+                try:
+                    slot = await limiter.acquire(priority)
+                    priority = slot.priority
+                    if is_disconnected is not None and await is_disconnected():
+                        raise asyncio.CancelledError
+                    break
+                except QueueFull:
+                    # The retry queue is saturated. Wait for room and try again
+                    # rather than surfacing a rate-limit error to the client.
+                    await asyncio.sleep(
+                        max(limiter.next_slot_in(), settings.backoff_base)
+                    )
+    except BaseException:
+        await limiter.release(slot)
+        raise
 
 
 def _sse_error(request_id: str, status_code: int, detail: str) -> bytes:

@@ -87,6 +87,8 @@ def make_app(fake_clock: FakeClock) -> Callable[..., AppFixture]:
             "backoff_base": 0.001,
             "sweep_interval": 0.001,
             "max_rpm": kwargs.pop("max_rpm", 40),
+            # Keep proxy tests bounded; production defaults to -1 (forever).
+            "http_retries": 3,
         }
         settings_kwargs.update(kwargs)
         settings = Settings(**settings_kwargs)

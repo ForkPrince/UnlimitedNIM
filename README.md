@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/shivnathtathe/UnlimitedNIM/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"/></a>
-  <a href="https://github.com/shivnathtathe/UnlimitedNIM"><img src="https://img.shields.io/badge/tests-43%20passing-brightgreen.svg" alt="Tests"/></a>
+  <a href="https://github.com/shivnathtathe/UnlimitedNIM"><img src="https://img.shields.io/badge/tests-47%20passing-brightgreen.svg" alt="Tests"/></a>
   <a href="https://github.com/shivnathtathe/UnlimitedNIM"><img src="https://img.shields.io/badge/NVIDIA%20NIM-40%20RPM-76b900.svg" alt="NVIDIA NIM"/></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python"/>
   <img src="https://img.shields.io/badge/FastAPI-async-009688.svg" alt="FastAPI"/>
@@ -47,6 +47,9 @@ invisible to your agent:
 - **Full-duplex streaming** — SSE responses stream straight through, chunk by chunk.
 - **Starvation protection** — a low-priority request stuck longer than the TTL is
   promoted so it eventually fires.
+- **Invisible 429 recovery** — if NVIDIA still returns `429`, the proxy releases
+  the slot, waits for the sliding window (or NVIDIA's `Retry-After`), and retries
+  without ever showing the rate-limit error to the client.
 - **Backpressure** — a bounded queue rejects with `503 + Retry-After` instead of
   leaking memory or flooding NVIDIA.
 
@@ -115,8 +118,8 @@ All options come from environment variables or a `.env` file (auto-loaded).
 | `WINDOW_SIZE` | `60` | Rate-limit window in seconds |
 | `MAX_QUEUE` | `500` | Max queue depth before rejecting with `503 + Retry-After` |
 | `RETRY_TTL` | `300` | Seconds before a queued low-priority request is promoted to priority 1 |
-| `HTTP_RETRIES` | `3` | Upstream `429` retries with exponential backoff |
-| `BACKOFF_BASE` | `1.0` | Backoff base seconds (sleeps 1s, 2s, 4s) |
+| `HTTP_RETRIES` | `-1` | Upstream `429` retries (`-1` = retry forever) |
+| `BACKOFF_BASE` | `1.0` | Backoff base seconds; waits at least until the sliding window has room, and honours `Retry-After` |
 | `CONNECT_TIMEOUT` | `30` | httpx connect timeout (s) |
 | `READ_TIMEOUT` | `60` | httpx read timeout (s) |
 | `WRITE_TIMEOUT` | `30` | httpx write timeout (s) |
@@ -196,7 +199,7 @@ app/
 main.py            # entry point
 load_test.py       # agentic traffic simulator
 mock_upstream.py   # fake NVIDIA upstream for local testing
-tests/             # 43 tests covering all 34 test-case specs
+tests/             # 47 tests covering all 34 test-case specs
 ```
 
 ## Test Coverage
@@ -207,5 +210,5 @@ in-flight tracking, priority ordering, starvation promotion, clock skew, upstrea
 `/status`).
 
 ```bash
-python -m pytest -q   # 43 passed
+python -m pytest -q   # 47 passed
 ```

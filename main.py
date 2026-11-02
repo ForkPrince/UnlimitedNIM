@@ -70,7 +70,7 @@ def print_banner(settings: Settings) -> None:
     print(f"{CYAN}╚{'═' * (width + 2)}╝{RESET}")
     print(f"{YELLOW}  Make NVIDIA's 40 RPM free tier feel unlimited.{RESET}")
     print(f"{DIM}  Built by Shivnath Tathe  |  github.com/shivnathtathe/UnlimitedNIM{RESET}")
-    print(f"{GREEN}  Listening on http://{settings.host}:{settings.port}/v1  |  43 tests passing  |  MIT License{RESET}")
+    print(f"{GREEN}  Listening on http://{settings.host}:{settings.port}/v1  |  47 tests passing  |  MIT License{RESET}")
     print()
 
 

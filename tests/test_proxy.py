@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
 
+from app import RateLimiter, Settings, create_app
 from app.proxy import _parse_priority, _stream_events
 from tests.conftest import cancel_all, mock_upstream_handler, settle, sse_chunks
 
@@ -32,6 +34,70 @@ async def test_tc018_upstream_429_exhausted_returns_429(make_app, standard_body)
         resp = await client.post("/v1/chat/completions", json=standard_body)
     assert resp.status_code == 429
     assert len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_tc018_upstream_429_retries_forever_when_configured(make_app, standard_body):
+    calls: list = []
+    handler = mock_upstream_handler(json_body={"ok": True}, count_429=5, calls=calls)
+    fx = make_app(handler=handler, http_retries=-1)
+    async with fx.client() as client:
+        resp = await client.post("/v1/chat/completions", json=standard_body)
+    assert resp.status_code == 200
+    assert len(calls) == 6
+
+
+@pytest.mark.asyncio
+async def test_tc018_streaming_429_retries_forever(make_app, standard_body):
+    calls: list = []
+    handler = mock_upstream_handler(body=sse_chunks({"a": 1}), count_429=3, calls=calls)
+    fx = make_app(handler=handler, http_retries=-1)
+    body = {**standard_body, "stream": True}
+    async with fx.client() as client:
+        resp = await client.post("/v1/chat/completions", json=body)
+    assert resp.status_code == 200
+    assert b"data:" in resp.content
+    assert len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_tc018_429_retry_waits_for_sliding_window():
+    calls: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            return httpx.Response(429, json={"error": "rate limited"}, request=request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    settings = Settings(
+        max_rpm=1,
+        window_size=0.2,
+        http_retries=-1,
+        backoff_base=0.001,
+    )
+    settings.transport = httpx.MockTransport(handler)
+    limiter = RateLimiter(
+        max_rpm=settings.max_rpm,
+        window_size=settings.window_size,
+        max_queue=settings.max_queue,
+        retry_ttl=settings.retry_ttl,
+    )
+    app = create_app(settings, limiter=limiter)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "meta/llama-3.3-70b-instruct",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert len(calls) == 2
+    assert calls[1] - calls[0] >= 0.15
 
 
 @pytest.mark.asyncio

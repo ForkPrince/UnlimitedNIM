@@ -1,7 +1,10 @@
 """Core sliding-window rate limiter with a priority queue.
 
 Accounting model:
-- `window_count` counts initiations since `window_start` (monotonic clock).
+- `_initiations` holds the monotonic timestamp of every request that has
+  actually fired. A new request may fire only when fewer than `max_rpm`
+  timestamps fall inside the trailing `window_size` seconds. This is a true
+  sliding window, so traffic cannot burst across a window boundary.
 - A slot is consumed the moment a request fires and is NEVER returned when the
   request completes, because NVIDIA already counted the initiation.
 - Requests still streaming live in `in_flight` for abort/timeout tracking only.
@@ -16,8 +19,9 @@ import heapq
 import itertools
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 
 class QueueFull(Exception):
@@ -63,8 +67,7 @@ class RateLimiter:
         self.sweep_interval = sweep_interval
         self._clock = clock
         self._seq = itertools.count()
-        self.window_start = self._clock()
-        self.window_count = 0
+        self._initiations: Deque[float] = deque()
         self.queue: List[Tuple[int, float, int, Entry]] = []
         self.in_flight: Dict[str, Entry] = {}
         self._lock = asyncio.Lock()
@@ -72,10 +75,34 @@ class RateLimiter:
         self.total_rejected = 0
         self.total_cancelled = 0
 
-    def _refresh_window(self, now: float) -> None:
-        if now - self.window_start >= self.window_size:
-            self.window_start = now
-            self.window_count = 0
+    def _prune(self, now: float) -> None:
+        """Drop initiations that have aged out of the trailing window."""
+        cutoff = now - self.window_size
+        while self._initiations and self._initiations[0] <= cutoff:
+            self._initiations.popleft()
+
+    @property
+    def window_count(self) -> int:
+        return len(self._initiations)
+
+    def next_slot_in(self, now: Optional[float] = None) -> float:
+        """Seconds until one more request may fire.
+
+        Returns 0.0 when the current window still has room.
+        """
+        now = now if now is not None else self._clock()
+        self._prune(now)
+        if not self._initiations or len(self._initiations) < self.max_rpm:
+            return 0.0
+        return max(0.0, self._initiations[0] + self.window_size - now)
+
+    def window_resets_in(self, now: Optional[float] = None) -> float:
+        """Seconds until the oldest initiation ages out of the window."""
+        now = now if now is not None else self._clock()
+        self._prune(now)
+        if not self._initiations:
+            return 0.0
+        return max(0.0, self._initiations[0] + self.window_size - now)
 
     def _grant(self, entry: Entry, now: float) -> Slot:
         entry.request_id = uuid.uuid4().hex
@@ -86,7 +113,7 @@ class RateLimiter:
             priority=entry.priority,
             entry=entry,
         )
-        self.window_count += 1
+        self._initiations.append(now)
         self.total_fired += 1
         self.in_flight[entry.request_id] = entry
         entry.fired.set()
@@ -111,9 +138,9 @@ class RateLimiter:
 
     async def _drain_locked(self) -> None:
         now = self._clock()
-        self._refresh_window(now)
+        self._prune(now)
         self._promote_starved(now)
-        available = self.max_rpm - self.window_count
+        available = self.max_rpm - len(self._initiations)
         while available > 0 and self.queue:
             _, _, _, entry = heapq.heappop(self.queue)
             if entry.cancelled:
@@ -135,15 +162,15 @@ class RateLimiter:
         while True:
             now = self._clock()
             async with self._lock:
-                self._refresh_window(now)
+                self._prune(now)
                 if self.queue:
                     await self._drain_locked()
                     now = self._clock()
-                if not self.queue and self.window_count < self.max_rpm:
+                if not self.queue and len(self._initiations) < self.max_rpm:
                     return self._grant(entry, now)
                 if len(self.queue) >= self.max_queue:
                     self.total_rejected += 1
-                    retry_after = max(1, int(self.window_start + self.window_size - now))
+                    retry_after = max(1, int(self.next_slot_in(now)))
                     raise QueueFull(retry_after)
                 heapq.heappush(self.queue, (entry.priority, entry.arrival_ts, entry.seq, entry))
             try:
@@ -189,16 +216,14 @@ class RateLimiter:
     def queue_depth(self) -> int:
         return len(self.queue)
 
-    def window_resets_in(self, now: Optional[float] = None) -> float:
-        now = now if now is not None else self._clock()
-        return max(0.0, self.window_start + self.window_size - now)
-
     def status(self) -> dict:
+        now = self._clock()
+        self._prune(now)
         return {
             "max_rpm": self.max_rpm,
             "window_size": self.window_size,
-            "window_count": self.window_count,
-            "window_resets_in": round(self.window_resets_in(), 2),
+            "window_count": len(self._initiations),
+            "window_resets_in": round(self.next_slot_in(now), 2),
             "queue_depth": len(self.queue),
             "in_flight": len(self.in_flight),
             "total_fired": self.total_fired,
