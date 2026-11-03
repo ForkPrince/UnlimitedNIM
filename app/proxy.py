@@ -178,14 +178,25 @@ async def _stream_events(
             error_payload = (await resp.aread()).decode("utf-8", "replace")
             yield _sse_error(slot.request_id, resp.status_code, error_payload)
             return
-        async for chunk in resp.aiter_bytes():
-            if await request.is_disconnected():
+        while True:
+            try:
+                async for chunk in resp.aiter_bytes():
+                    if await request.is_disconnected():
+                        break
+                    yield chunk
                 break
-            yield chunk
+            except httpx.ReadTimeout:
+                # Long pause between upstream chunks (e.g. model thinking).
+                # Emit an SSE keep-alive comment so the connection stays alive,
+                # then try reading again instead of aborting the whole stream.
+                yield b": keep-alive\n\n"
     except asyncio.CancelledError:
         raise
     except GeneratorExit:
         pass
+    except httpx.ReadTimeout as exc:
+        log.warning("stream read timeout for %s; ending stream gracefully", slot.request_id)
+        yield b": keep-alive\n\n"
     except Exception as exc:
         log.exception("stream failure for %s", slot.request_id)
         yield _sse_error(slot.request_id, 500, f"stream failure: {exc}")
