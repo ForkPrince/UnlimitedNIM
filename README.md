@@ -45,6 +45,9 @@ invisible to your agent:
   - **priority 3** — agent loop tool calls (the bulk of traffic)
   - **priority 5** — debug dumps and huge stack traces (fire when there's room)
 - **Full-duplex streaming** — SSE responses stream straight through, chunk by chunk.
+- **Long-thinking resilience** — if the model pauses between chunks (thinking, or
+  generating a massive file edit), the proxy emits SSE `: keep-alive` comments and
+  keeps the stream open instead of aborting it on a read timeout.
 - **Starvation protection** — a low-priority request stuck longer than the TTL is
   promoted so it eventually fires.
 - **Invisible 429 recovery** — if NVIDIA still returns `429`, the proxy releases
@@ -117,14 +120,14 @@ All options come from environment variables or a `.env` file (auto-loaded).
 | `MAX_RPM` | `40` | Max requests per minute (matches NVIDIA free tier) |
 | `WINDOW_SIZE` | `60` | Rate-limit window in seconds |
 | `MAX_QUEUE` | `500` | Max queue depth before rejecting with `503 + Retry-After` |
-| `RETRY_TTL` | `300` | Seconds before a queued low-priority request is promoted to priority 1 |
+| `RETRY_TTL` | `60` | Seconds before a queued low-priority request is promoted to priority 1 |
 | `HTTP_RETRIES` | `-1` | Upstream `429` retries (`-1` = retry forever) |
 | `BACKOFF_BASE` | `1.0` | Backoff base seconds; waits at least until the sliding window has room, and honours `Retry-After` |
 | `CONNECT_TIMEOUT` | `30` | httpx connect timeout (s) |
-| `READ_TIMEOUT` | `60` | httpx read timeout (s) |
+| `READ_TIMEOUT` | `300` | httpx read timeout (s); also the stream idle-keep-alive interval |
 | `WRITE_TIMEOUT` | `30` | httpx write timeout (s) |
 | `POOL_TIMEOUT` | `30` | httpx pool timeout (s) |
-| `MAX_STREAM_AGE` | `300` | Max age of an in-flight stream before the sweeper force-releases it |
+| `MAX_STREAM_AGE` | `300` | Max consecutive idle seconds on a stream; also max in-flight age before the sweeper force-releases it |
 | `SWEEP_INTERVAL` | `5` | Sweeper interval (s) |
 | `LARGE_BODY_BYTES` | `262144` | Payload bytes above which a request defaults to priority 5 |
 | `HOST` | `0.0.0.0` | Bind address |

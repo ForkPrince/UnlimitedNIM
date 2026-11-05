@@ -32,7 +32,7 @@ class Settings:
     max_rpm: int = field(default_factory=lambda: _env_int("MAX_RPM", 40))
     window_size: float = field(default_factory=lambda: _env_float("WINDOW_SIZE", 60.0))
     max_queue: int = field(default_factory=lambda: _env_int("MAX_QUEUE", 500))
-    retry_ttl: float = field(default_factory=lambda: _env_float("RETRY_TTL", 300.0))
+    retry_ttl: float = field(default_factory=lambda: _env_float("RETRY_TTL", 60.0))
     # -1 = retry upstream 429s forever (the proxy stays transparent to clients)
     http_retries: int = field(default_factory=lambda: _env_int("HTTP_RETRIES", -1))
     backoff_base: float = field(default_factory=lambda: _env_float("BACKOFF_BASE", 1.0))
@@ -73,12 +73,10 @@ class Settings:
     def upstream_url(self) -> str:
         return f"{self.nvidia_base_url}/chat/completions"
 
-    def httpx_timeout(self):
-        import httpx
-
+    def httpx_timeout(self, stream: bool = False):
         return httpx.Timeout(
             connect=self.connect_timeout,
-            read=self.read_timeout,
+            read=None if stream else self.read_timeout,
             write=self.write_timeout,
             pool=self.pool_timeout,
         )

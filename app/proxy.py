@@ -8,6 +8,7 @@ import email.utils
 import json
 import logging
 import random
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Awaitable, Callable, Optional, Tuple
@@ -164,6 +165,7 @@ async def _stream_events(
 ) -> AsyncGenerator[bytes, None]:
     client: Optional[httpx.AsyncClient] = None
     resp: Optional[httpx.Response] = None
+    pump_task: Optional[asyncio.Task] = None
     try:
         slot, client, resp = await _acquire_and_open(
             limiter,
@@ -178,29 +180,55 @@ async def _stream_events(
             error_payload = (await resp.aread()).decode("utf-8", "replace")
             yield _sse_error(slot.request_id, resp.status_code, error_payload)
             return
-        while True:
+
+        chunks: asyncio.Queue = asyncio.Queue()
+
+        async def pump() -> None:
             try:
                 async for chunk in resp.aiter_bytes():
-                    if await request.is_disconnected():
-                        break
-                    yield chunk
-                break
-            except httpx.ReadTimeout:
-                # Long pause between upstream chunks (e.g. model thinking).
-                # Emit an SSE keep-alive comment so the connection stays alive,
-                # then try reading again instead of aborting the whole stream.
+                    chunks.put_nowait(chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                chunks.put_nowait(exc)
+            finally:
+                chunks.put_nowait(None)
+
+        pump_task = asyncio.create_task(pump())
+        last_activity = time.monotonic()
+        while True:
+            try:
+                item = await asyncio.wait_for(chunks.get(), settings.read_timeout)
+            except asyncio.TimeoutError:
+                if time.monotonic() - last_activity > settings.max_stream_age:
+                    log.warning(
+                        "stream %s idle for over max_stream_age (%.0fs); ending gracefully",
+                        slot.request_id,
+                        settings.max_stream_age,
+                    )
+                    return
                 yield b": keep-alive\n\n"
+                continue
+            last_activity = time.monotonic()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            if await request.is_disconnected():
+                break
+            yield item
     except asyncio.CancelledError:
         raise
     except GeneratorExit:
         pass
-    except httpx.ReadTimeout as exc:
-        log.warning("stream read timeout for %s; ending stream gracefully", slot.request_id)
-        yield b": keep-alive\n\n"
     except Exception as exc:
         log.exception("stream failure for %s", slot.request_id)
         yield _sse_error(slot.request_id, 500, f"stream failure: {exc}")
     finally:
+        if pump_task is not None:
+            pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump_task
         if resp is not None:
             await resp.aclose()
         if client is not None:
@@ -218,7 +246,7 @@ async def _open_upstream(
         "x-request-id": request_id,
     }
     url = settings.upstream_url()
-    kwargs: dict = {"timeout": settings.httpx_timeout()}
+    kwargs: dict = {"timeout": settings.httpx_timeout(stream=bool(body.get("stream")))}
     if settings.transport is not None:
         kwargs["transport"] = settings.transport
     client = httpx.AsyncClient(**kwargs)

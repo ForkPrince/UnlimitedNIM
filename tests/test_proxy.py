@@ -143,6 +143,39 @@ async def test_streaming_success_releases_slot(make_app, standard_body):
 
 
 @pytest.mark.asyncio
+async def test_stream_survives_long_pause_between_chunks(make_app, standard_body):
+    class SlowStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"part": 1}\n\n'
+            await asyncio.sleep(0.3)
+            yield b'data: {"part": 2}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self):
+            pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=SlowStream(),
+            request=request,
+        )
+
+    fx = make_app(handler=handler, read_timeout=0.05, max_stream_age=5.0)
+    body = {**standard_body, "stream": True}
+    async with fx.client() as client:
+        resp = await client.post("/v1/chat/completions", json=body)
+    assert resp.status_code == 200
+    assert b'"part": 1' in resp.content
+    assert b'"part": 2' in resp.content
+    assert b"[DONE]" in resp.content
+    assert b": keep-alive" in resp.content
+    assert b"error" not in resp.content
+    assert fx.limiter.in_flight == {}
+
+
+@pytest.mark.asyncio
 async def test_tc031_nonstream_completion_keeps_window_and_drains(make_app, standard_body):
     fx = make_app(handler=mock_upstream_handler(json_body={"ok": True}))
     slots = await asyncio.gather(*[fx.limiter.acquire(3) for _ in range(40)])
